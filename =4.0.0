@@ -1,0 +1,4 @@
+Requirement already satisfied: bcrypt in c:\moi\sources\agent-avv\backend\venv\lib\site-packages (5.0.0)
+
+[notice] A new release of pip is available: 25.2 -> 26.0.1
+[notice] To update, run: C:\Moi\Sources\Agent-AVV\backend\venv\Scripts\python.exe -m pip install --upgrade pip
