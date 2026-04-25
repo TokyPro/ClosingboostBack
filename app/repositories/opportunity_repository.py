@@ -11,8 +11,7 @@ class OpportunityRepository:
     async def get_all(self, owner_id: Optional[UUID] = None) -> List[Opportunity]:
         stmt = select(Opportunity)
         if owner_id:
-            uid_str = str(owner_id)
-            stmt = stmt.filter(Opportunity.owner_id == uid_str)
+            stmt = stmt.filter(Opportunity.owner_id == str(owner_id))
         stmt = stmt.order_by(Opportunity.created_at.desc())
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
@@ -24,13 +23,10 @@ class OpportunityRepository:
 
     async def create(self, opportunity: Opportunity) -> Opportunity:
         self.db.add(opportunity)
-        await self.db.commit()
-        await self.db.refresh(opportunity)
         return opportunity
 
     async def update(self, opportunity: Opportunity) -> Opportunity:
-        await self.db.commit()
-        await self.db.refresh(opportunity)
+        # State is already modified on the object, no action needed for ORM
         return opportunity
 
     async def delete(self, opportunity_id: UUID) -> bool:
@@ -38,7 +34,6 @@ class OpportunityRepository:
         if not opp:
             return False
         await self.db.delete(opp)
-        await self.db.commit()
         return True
 
     async def search(self, owner_id: UUID, query: str) -> List[Opportunity]:

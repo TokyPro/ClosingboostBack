@@ -1,0 +1,21 @@
+services:
+  backend-service:
+    build: ./backend
+    container_name: salesboost-api
+    ports:
+      - "8000:8000"
+    restart: always
+	- DATABASE_URL=sqlite+aiosqlite:///./salesboost.db
+	- GOOGLE_API_KEY=AIzaSyDjT162oRPACmmSZXOosBZo6NbNa3-1oPg
+	- SECRET_KEY=o1ChIu8My4MrZw24ImQOZNxMOuCK34l3AZL6_Y65HkA
+	- GEMINI_MODEL=gemini-2.5-flash
+
+  frontend-service:
+    build: ./frontend
+    container_name: salesboost-web
+    ports:
+      - "80:80"
+    restart: always
+    depends_on:
+      - backend-service
+

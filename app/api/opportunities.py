@@ -8,14 +8,16 @@ from uuid import UUID
 
 router = APIRouter()
 
+def get_opportunity_service(db: AsyncSession = Depends(get_db)) -> OpportunityService:
+    return OpportunityService(db)
+
 @router.get("/", response_model=List[OpportunitySchema], summary="List all opportunities")
 @router.get("/list", response_model=List[OpportunitySchema], include_in_schema=False)
 async def list_opportunities(
     user_id: UUID = Query(...),
-    db: AsyncSession = Depends(get_db)
+    service: OpportunityService = Depends(get_opportunity_service)
 ):
     """Returns all sales opportunities for the given user."""
-    service = OpportunityService(db)
     return await service.list_opportunities(user_id)
 
 @router.post("/", response_model=OpportunitySchema, status_code=status.HTTP_201_CREATED, summary="Create a new opportunity")
@@ -23,10 +25,9 @@ async def list_opportunities(
 async def create_opportunity(
     opp_in: OpportunityCreate,
     user_id: UUID = Query(...),
-    db: AsyncSession = Depends(get_db)
+    service: OpportunityService = Depends(get_opportunity_service)
 ):
     """Creates an opportunity and triggers a Gemini 2.5 Flash briefing via RAG."""
-    service = OpportunityService(db)
     return await service.create_opportunity(
         title=opp_in.title,
         company_name=opp_in.company_name,
@@ -44,19 +45,17 @@ async def create_opportunity(
 async def search_opportunities(
     user_id: UUID = Query(...),
     q: str = Query(...),
-    db: AsyncSession = Depends(get_db)
+    service: OpportunityService = Depends(get_opportunity_service)
 ):
     """Full-text search on title and company name."""
-    service = OpportunityService(db)
     return await service.search_opportunities(user_id, q)
 
 @router.get("/{opportunity_id}", response_model=OpportunitySchema, summary="Get opportunity by ID")
 async def get_opportunity(
     opportunity_id: UUID,
-    db: AsyncSession = Depends(get_db)
+    service: OpportunityService = Depends(get_opportunity_service)
 ):
     """Returns a single opportunity by its UUID."""
-    service = OpportunityService(db)
     opp = await service.get_opportunity(opportunity_id)
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
@@ -66,10 +65,9 @@ async def get_opportunity(
 async def update_opportunity(
     opportunity_id: UUID,
     update_in: OpportunityUpdate,
-    db: AsyncSession = Depends(get_db)
+    service: OpportunityService = Depends(get_opportunity_service)
 ):
     """Updates any field of an opportunity."""
-    service = OpportunityService(db)
     opp = await service.update_opportunity(
         opportunity_id=opportunity_id,
         title=update_in.title,
@@ -90,10 +88,9 @@ async def update_opportunity(
 @router.delete("/{opportunity_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete opportunity")
 async def delete_opportunity(
     opportunity_id: UUID,
-    db: AsyncSession = Depends(get_db)
+    service: OpportunityService = Depends(get_opportunity_service)
 ):
     """Permanently deletes an opportunity and its associated briefing."""
-    service = OpportunityService(db)
     deleted = await service.delete_opportunity(opportunity_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Opportunity not found")
@@ -102,10 +99,9 @@ async def delete_opportunity(
 @router.get("/{opportunity_id}/briefing", response_model=BriefingSchema, summary="Get AI briefing")
 async def get_briefing(
     opportunity_id: UUID,
-    db: AsyncSession = Depends(get_db)
+    service: OpportunityService = Depends(get_opportunity_service)
 ):
     """Retrieves the strategic AI briefing for a specific opportunity."""
-    service = OpportunityService(db)
     briefing = await service.get_briefing(opportunity_id)
     if not briefing:
         raise HTTPException(status_code=404, detail="Briefing not found")

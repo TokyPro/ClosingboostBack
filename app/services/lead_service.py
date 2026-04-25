@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import logging
@@ -8,10 +9,8 @@ import uuid
 from typing import Optional
 from uuid import UUID
 
-import httpx
-import urllib.parse
-from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler
+from ddgs import DDGS
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import settings
@@ -62,45 +61,69 @@ class LeadService:
         self.ai_service = ai_service
 
     async def search_leads(self, request: LeadSearchRequest) -> LeadSearchResponse:
-        # Instead of Tavily, we now use Crawl4AI to search via DuckDuckGo HTML
-        all_raw: list[dict] = []
+        # Build per-source search tasks and run them in parallel
+        tasks: list[asyncio.coroutine] = []
+        task_labels: list[str] = []
 
-        # Sources logic: we map sources to specific search queries or domain filters
         if "linkedin" in request.sources:
-            linkedin_results = await self._crawl4ai_search(
+            tasks.append(self._ddgs_search(
                 query=self._build_query(request),
                 max_results=request.max_results,
                 include_domains=["linkedin.com"],
-            )
-            all_raw.extend(linkedin_results)
+            ))
+            task_labels.append("linkedin")
 
         if "datagouv" in request.sources:
-            dg_parts = [p for p in [request.query, request.activity_sector, request.location] if p]
-            dg_query = " ".join(dg_parts + ["entreprise"]) if dg_parts else "entreprise annuaire"
-            dg_results = await self._crawl4ai_search(
+            dg_query = " ".join(filter(None, [
+                request.query, request.activity_sector, request.location, "entreprise"
+            ])) or "entreprise annuaire"
+            tasks.append(self._ddgs_search(
                 query=dg_query,
-                max_results=max(5, request.max_results // 2),
+                max_results=max(10, request.max_results // 2),
                 include_domains=["data.gouv.fr", "annuaire-entreprises.data.gouv.fr", "entreprises.data.gouv.fr"],
-            )
-            existing_urls = {r["url"] for r in all_raw}
-            all_raw.extend(r for r in dg_results if r["url"] not in existing_urls)
+            ))
+            task_labels.append("datagouv")
 
         if "web" in request.sources:
-            web_parts = [p for p in [request.query, request.activity_sector, request.location] if p]
-            web_query = " ".join(web_parts + ["contact professionnel"]) if web_parts else "contact professionnel B2B"
-            web_results = await self._crawl4ai_search(
+            web_query = " ".join(filter(None, [
+                request.query, request.activity_sector, request.location, "contact professionnel"
+            ])) or "contact professionnel B2B"
+            tasks.append(self._ddgs_search(
                 query=web_query,
-                max_results=max(5, request.max_results // 2),
+                max_results=max(10, request.max_results // 2),
                 include_domains=[],
+            ))
+            task_labels.append("web")
+
+        if not tasks:
+            return LeadSearchResponse(
+                leads=[], total=0,
+                query_used=self._build_query(request), demo_mode=False,
             )
-            existing_urls = {r["url"] for r in all_raw}
-            all_raw.extend(r for r in web_results if r["url"] not in existing_urls)
+
+        source_results = await asyncio.gather(*tasks)
+        logger.info("DDGS results per source: %s", {
+            label: len(res) for label, res in zip(task_labels, source_results)
+        })
+
+        # Deduplicate by URL across sources
+        seen_urls: set[str] = set()
+        all_raw: list[dict] = []
+        for results in source_results:
+            for r in results:
+                url = r.get("url", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    all_raw.append(r)
 
         if not all_raw:
             return LeadSearchResponse(
                 leads=[], total=0,
                 query_used=self._build_query(request), demo_mode=False,
             )
+
+        # Enrich results that have thin snippets using Crawl4AI
+        all_raw = await self._enrich_with_crawl4ai(all_raw, max_pages=8)
 
         leads = await self._extract_with_ai(all_raw, request)
         return LeadSearchResponse(
@@ -114,100 +137,77 @@ class LeadService:
         parts = [p for p in [request.query, request.activity_sector, request.location] if p]
         return " ".join(parts) if parts else "professionnel contact"
 
-    async def _crawl4ai_search(
+    async def _ddgs_search(
         self,
         query: str,
         max_results: int,
-        include_domains: list[str] = None,
+        include_domains: list[str] | None = None,
     ) -> list[dict]:
-        """Search via DuckDuckGo HTML with pagination to retrieve more results."""
+        """Search via duckduckgo-search library with reliable multi-page support."""
         search_query = query
         if include_domains:
-            search_query += " site:" + " OR site:".join(include_domains)
-        
-        results = []
-        # Initial URL
-        current_url = "https://html.duckduckgo.com/html/"
-        payload = {"q": search_query}
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
+            site_parts = " OR ".join(f"site:{d}" for d in include_domains)
+            search_query = f"{query} ({site_parts})"
+
+        def _sync() -> list[dict]:
+            results: list[dict] = []
+            try:
+                with DDGS() as ddgs:
+                    for r in ddgs.text(search_query, max_results=max_results, safesearch="off"):
+                        results.append({
+                            "url": r["href"],
+                            "title": r["title"],
+                            "content": r.get("body", ""),
+                            "score": 0.8,
+                        })
+            except Exception as exc:
+                logger.error("DDGS search error for '%s': %s", search_query, exc)
+            return results
+
+        return await asyncio.to_thread(_sync)
+
+    async def _enrich_with_crawl4ai(
+        self,
+        results: list[dict],
+        max_pages: int = 8,
+    ) -> list[dict]:
+        """Scrape result pages with Crawl4AI to enrich thin snippets."""
+        enriched = [r.copy() for r in results]
+        # Only crawl results whose snippet is too short and URL is accessible
+        to_crawl = [
+            (i, r) for i, r in enumerate(enriched[:max_pages])
+            if r.get("url", "").startswith("http") and len(r.get("content", "")) < 80
+        ]
+        if not to_crawl:
+            return enriched
 
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                while len(results) < max_results:
-                    # DuckDuckGo HTML uses POST for the search and pagination
-                    resp = await client.post(current_url, data=payload, headers=headers)
-                    if resp.status_code != 200:
-                        logger.error("DuckDuckGo search failed with status %s", resp.status_code)
-                        break
-                    
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    items = soup.select(".result")
-                    
-                    if not items:
-                        break
-
-                    for item in items:
-                        if len(results) >= max_results:
-                            break
-                            
-                        link_tag = item.select_one(".result__a")
-                        snippet_tag = item.select_one(".result__snippet")
-                        if link_tag and link_tag.get("href"):
-                            link_url = link_tag.get("href")
-                            if "uddg=" in link_url:
-                                parsed_url = urllib.parse.urlparse(link_url)
-                                query_params = urllib.parse.parse_qs(parsed_url.query)
-                                if "uddg" in query_params:
-                                    link_url = query_params["uddg"][0]
-                            
-                            results.append({
-                                "url": link_url,
-                                "title": link_tag.get_text(strip=True),
-                                "content": snippet_tag.get_text(strip=True) if snippet_tag else "",
-                                "score": 0.8,
-                            })
-                    
-                    # Look for the "Next" button form
-                    next_form = soup.find("form", attrs={"action": "/html/"})
-                    if not next_form:
-                        # Sometimes the action is absolute or different
-                        next_form = soup.find("form", attrs={"action": re.compile(r".*/html/.*")})
-                    
-                    if next_form:
-                        # Extract all hidden inputs for the next page
-                        next_payload = {}
-                        for inp in next_form.find_all("input", type="hidden"):
-                            next_payload[inp.get("name")] = inp.get("value")
-                        
-                        # The search query 'q' is also usually in the form
-                        if "q" not in next_payload:
-                            next_payload["q"] = search_query
-                            
-                        payload = next_payload
-                        # current_url remains the same for the form action usually
-                    else:
-                        break
-                
-                return results
+            async with AsyncWebCrawler(verbose=False) as crawler:
+                crawl_tasks = [
+                    crawler.arun(url=r["url"], timeout=10) for _, r in to_crawl
+                ]
+                crawl_results = await asyncio.gather(*crawl_tasks, return_exceptions=True)
+                for (idx, _), result in zip(to_crawl, crawl_results):
+                    if isinstance(result, Exception):
+                        logger.debug("Crawl4AI failed for idx %d: %s", idx, result)
+                        continue
+                    if hasattr(result, "markdown") and result.markdown:
+                        enriched[idx]["content"] = result.markdown[:600]
         except Exception as exc:
-            logger.error("Search pagination exception: %s", exc)
-            return []
+            logger.warning("Crawl4AI enrichment skipped: %s", exc)
+
+        return enriched
 
     async def _extract_with_ai(
         self,
         raw_results: list[dict],
         request: LeadSearchRequest,
     ) -> list[LeadResult]:
-        # We process all results found, or a larger batch (e.g. 50) to avoid LLM context issues, 
-        # but the user requested 'not to limit', so we'll increase the processing window.
         results_for_prompt = [
             {
                 "url": r.get("url", ""),
                 "title": r.get("title", ""),
-                "content": (r.get("content") or "")[:400],
+                "content": (r.get("content") or "")[:300],
             }
             for r in raw_results
         ]
@@ -319,7 +319,6 @@ class LeadDBService:
         self.repo = LeadRepository(db)
 
     async def save(self, data: LeadSaveRequest) -> LeadRecord:
-        # Deduplicate by LinkedIn URL when available
         if data.linkedin_url:
             existing = await self.repo.get_by_linkedin_url(data.linkedin_url)
             if existing:
@@ -341,7 +340,6 @@ class LeadDBService:
         )
         saved = await self.repo.create(lead)
 
-        # Initialize scoring fields inline to avoid circular imports
         saved.fit_score = round((data.relevance_score or 0.0) * 100, 2)
         saved.intent_score = 10.0
         raw_score = saved.fit_score * 0.4 + saved.intent_score * 0.6

@@ -13,7 +13,7 @@ class LeadSearchRequest(BaseModel):
     location: str = ""
     activity_sector: str = ""
     sources: list[str] = ["linkedin", "datagouv", "web"]
-    max_results: int = Field(default=20, ge=1)
+    max_results: int = Field(default=50, ge=1, le=200)
 
 
 class LeadResult(BaseModel):

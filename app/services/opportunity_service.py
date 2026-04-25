@@ -22,11 +22,17 @@ def _coerce_text(value: Any) -> Optional[str]:
     return str(value)
 
 class OpportunityService:
-    def __init__(self, db: AsyncSession):
+    def __init__(
+        self,
+        db: AsyncSession,
+        opp_repo: Optional[OpportunityRepository] = None,
+        brief_repo: Optional[BriefingRepository] = None,
+        ai_service: Optional[AIIntelligenceService] = None,
+    ):
         self.db = db
-        self.opp_repo = OpportunityRepository(db)
-        self.brief_repo = BriefingRepository(db)
-        self.ai_service = AIIntelligenceService()
+        self.opp_repo = opp_repo or OpportunityRepository(db)
+        self.brief_repo = brief_repo or BriefingRepository(db)
+        self.ai_service = ai_service or AIIntelligenceService()
 
     async def list_opportunities(self, user_id: UUID) -> List[Opportunity]:
         return await self.opp_repo.get_all(owner_id=user_id)
@@ -42,10 +48,10 @@ class OpportunityService:
         user_id: UUID,
         priority: str = "medium",
         win_probability: float = 0.0,
-        contact_name: Optional[str] = None,
-        contact_email: Optional[str] = None,
-        contact_phone: Optional[str] = None,
-        meeting_date: Optional[datetime] = None,
+        contact_name: str | None = None,
+        contact_email: str | None = None,
+        contact_phone: str | None = None,
+        meeting_date: datetime | None = None,
     ) -> Opportunity:
         opp = Opportunity(
             title=title,
@@ -61,6 +67,8 @@ class OpportunityService:
             meeting_date=meeting_date,
         )
         created_opp = await self.opp_repo.create(opp)
+        await self.db.commit()
+        await self.db.refresh(created_opp)
 
         try:
             await self._generate_and_save_briefing(created_opp)
@@ -98,21 +106,23 @@ class OpportunityService:
             buyer_persona=_coerce_text(ai_brief.get("buyer_persona")),
             value_prop_alignment=_coerce_text(ai_brief.get("value_prop_alignment")),
         )
-        return await self.brief_repo.create(briefing)
+        created_briefing = await self.brief_repo.create(briefing)
+        await self.db.commit()
+        return created_briefing
 
     async def update_opportunity(
         self,
         opportunity_id: UUID,
-        title: Optional[str] = None,
-        company_name: Optional[str] = None,
-        value: Optional[float] = None,
-        stage: Optional[str] = None,
-        win_probability: Optional[float] = None,
-        priority: Optional[str] = None,
-        contact_name: Optional[str] = None,
-        contact_email: Optional[str] = None,
-        contact_phone: Optional[str] = None,
-        meeting_date: Optional[datetime] = None,
+        title: str | None = None,
+        company_name: str | None = None,
+        value: float | None = None,
+        stage: str | None = None,
+        win_probability: float | None = None,
+        priority: str | None = None,
+        contact_name: str | None = None,
+        contact_email: str | None = None,
+        contact_phone: str | None = None,
+        meeting_date: datetime | None = None,
     ) -> Optional[Opportunity]:
         opp = await self.opp_repo.get_by_id(opportunity_id)
         if not opp:
@@ -137,10 +147,17 @@ class OpportunityService:
             opp.contact_phone = contact_phone
         if meeting_date is not None:
             opp.meeting_date = meeting_date
-        return await self.opp_repo.update(opp)
+        
+        updated_opp = await self.opp_repo.update(opp)
+        await self.db.commit()
+        await self.db.refresh(updated_opp)
+        return updated_opp
 
     async def delete_opportunity(self, opportunity_id: UUID) -> bool:
-        return await self.opp_repo.delete(opportunity_id)
+        success = await self.opp_repo.delete(opportunity_id)
+        if success:
+            await self.db.commit()
+        return success
 
     async def search_opportunities(self, user_id: UUID, query: str) -> List[Opportunity]:
         return await self.opp_repo.search(owner_id=user_id, query=query)

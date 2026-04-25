@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from uuid import UUID
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -10,12 +10,10 @@ class UserCreate(UserBase):
     password: str
 
 class UserSchema(UserBase):
+    model_config = ConfigDict(from_attributes=True)
     id: UUID
     role: str
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 class Token(BaseModel):
     access_token: str
@@ -46,6 +44,7 @@ class OpportunityUpdate(BaseModel):
     meeting_date: Optional[datetime] = None
 
 class BriefingSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     id: UUID
     opportunity_id: UUID
     ai_strategy: str
@@ -54,10 +53,8 @@ class BriefingSchema(BaseModel):
     buyer_persona: Optional[str] = None
     value_prop_alignment: Optional[str] = None
 
-    class Config:
-        from_attributes = True
-
 class OpportunitySchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     id: UUID
     title: str
     company_name: str
@@ -70,9 +67,6 @@ class OpportunitySchema(BaseModel):
     contact_phone: Optional[str] = None
     meeting_date: Optional[datetime] = None
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 # ── Interactions ─────────────────────────────────────────────────────────────
 
@@ -87,11 +81,9 @@ class InteractionCreate(InteractionBase):
     pass
 
 class InteractionSchema(InteractionBase):
+    model_config = ConfigDict(from_attributes=True)
     id: UUID
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 # ── Copilot / Requirements Gathering ─────────────────────────────────────────
 
@@ -137,6 +129,7 @@ class UserCreateAdmin(BaseModel):
     role: str = "executive"
 
 class DocumentSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     id: str
     original_name: str
     category: str
@@ -146,9 +139,6 @@ class DocumentSchema(BaseModel):
     google_file_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
-
-    class Config:
-        from_attributes = True
 
 class AdminStats(BaseModel):
     user_count: int
