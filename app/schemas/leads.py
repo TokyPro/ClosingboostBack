@@ -3,17 +3,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 # ── Search (stateless, no DB) ─────────────────────────────────────────────────
 
 class LeadSearchRequest(BaseModel):
-    query: str = ""
-    location: str = ""
-    activity_sector: str = ""
+    message: str = ""
     sources: list[str] = ["linkedin", "datagouv", "web"]
-    max_results: int = Field(default=50, ge=1, le=200)
 
 
 class LeadResult(BaseModel):
@@ -34,6 +31,7 @@ class LeadSearchResponse(BaseModel):
     total: int
     query_used: str
     demo_mode: bool = False
+    ai_response: Optional[str] = None
 
 
 # ── DB persistence ────────────────────────────────────────────────────────────

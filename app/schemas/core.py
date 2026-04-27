@@ -13,11 +13,16 @@ class UserSchema(UserBase):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     role: str
+    status: str = "active"
     created_at: datetime
 
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
 
 class OpportunityCreate(BaseModel):
     title: str = Field(..., example="Cloud ERP Modernization")

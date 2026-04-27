@@ -10,10 +10,11 @@ if sys.platform == "win32":
         pass
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from .api import auth
 from .api import opportunities
 from .api import copilot
 from .api import dev
@@ -24,12 +25,43 @@ from .api import admin as admin_api
 from .api import leads
 from .api import scoring as scoring_api
 from .api import agents as agents_api
+from sqlalchemy import text
 from .core.config import settings
-from .database import create_db_and_tables
+from .core.security import get_current_user, get_password_hash
+from .database import create_db_and_tables, AsyncSessionLocal, engine
+from .models.core import User
+from .repositories.user_repository import UserRepository
+
+ADMIN_EMAIL = "admin@salesboost.ai"
+ADMIN_PASSWORD = "admin"
+
+async def _migrate_db() -> None:
+    """Apply any missing schema changes that create_all cannot handle."""
+    async with engine.begin() as conn:
+        # Add status column to users if it doesn't exist (SQLite-compatible check)
+        result = await conn.execute(text("PRAGMA table_info(users)"))
+        columns = {row[1] for row in result.fetchall()}
+        if "status" not in columns:
+            await conn.execute(text("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'"))
+
+
+async def _seed_admin() -> None:
+    async with AsyncSessionLocal() as db:
+        repo = UserRepository(db)
+        if not await repo.get_by_email(ADMIN_EMAIL):
+            admin = User(
+                email=ADMIN_EMAIL,
+                hashed_password=get_password_hash(ADMIN_PASSWORD),
+                role="admin",
+                status="active",
+            )
+            await repo.create(admin)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await create_db_and_tables()
+    await _migrate_db()
+    await _seed_admin()
     yield
 
 app = FastAPI(
@@ -85,16 +117,19 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
         content={"detail": "An unexpected error occurred. Please try again."},
     )
 
-app.include_router(opportunities.router, prefix="/api/opportunities", tags=["Sales Pipeline"])
-app.include_router(interactions.router, prefix="/api/interactions", tags=["Interactions"])
-app.include_router(copilot.router, prefix="/api/copilot", tags=["Copilot"])
+_auth_dep = [Depends(get_current_user)]
+
+app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
+app.include_router(opportunities.router, prefix="/api/opportunities", tags=["Sales Pipeline"], dependencies=_auth_dep)
+app.include_router(interactions.router, prefix="/api/interactions", tags=["Interactions"], dependencies=_auth_dep)
+app.include_router(copilot.router, prefix="/api/copilot", tags=["Copilot"], dependencies=_auth_dep)
 app.include_router(users.router, prefix="/api/users", tags=["Users"])
 app.include_router(dev.router, prefix="/api/dev", tags=["Dev"])
-app.include_router(documents.router, prefix="/api/documents", tags=["Knowledge Base"])
-app.include_router(admin_api.router, prefix="/api/admin", tags=["Admin"])
-app.include_router(leads.router, prefix="/api/leads", tags=["Lead Intelligence"])
-app.include_router(scoring_api.router, prefix="/api/scoring", tags=["Scoring & Segmentation"])
-app.include_router(agents_api.router, prefix="/api/agents", tags=["AI Agents"])
+app.include_router(documents.router, prefix="/api/documents", tags=["Knowledge Base"], dependencies=_auth_dep)
+app.include_router(admin_api.router, prefix="/api/admin", tags=["Admin"], dependencies=_auth_dep)
+app.include_router(leads.router, prefix="/api/leads", tags=["Lead Intelligence"], dependencies=_auth_dep)
+app.include_router(scoring_api.router, prefix="/api/scoring", tags=["Scoring & Segmentation"], dependencies=_auth_dep)
+app.include_router(agents_api.router, prefix="/api/agents", tags=["AI Agents"], dependencies=_auth_dep)
 
 @app.get("/", tags=["System"])
 async def health_check():

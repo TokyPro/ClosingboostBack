@@ -4,16 +4,17 @@ import asyncio
 import datetime
 import json
 import logging
+import platform
 import re
 import uuid
 from typing import Optional
 from uuid import UUID
 
 from crawl4ai import AsyncWebCrawler
+from crawl4ai.async_configs import CrawlerRunConfig
 from ddgs import DDGS
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..core.config import settings
 from ..models.core import Lead
 from ..repositories.lead_repository import LeadRepository
 from ..schemas.leads import (
@@ -28,6 +29,15 @@ from ..schemas.leads import (
 from .ai_service import AIIntelligenceService
 
 logger = logging.getLogger(__name__)
+
+CHAT_PARSE_PROMPT = """Tu es un assistant de recherche de leads commerciaux B2B.
+
+L'utilisateur demande : "{message}"
+
+Analyse sa demande et extrais les paramètres de recherche.
+
+Retourne UNIQUEMENT un objet JSON valide (sans markdown) :
+{{"query": "<mots-clés principaux : poste, rôle, ou type de profil>", "location": "<ville/région/pays ou null>", "activity_sector": "<secteur d'activité ou null>", "ai_response": "<réponse en 1-2 phrases en français confirmant ce que tu vas chercher>"}}"""
 
 LEAD_EXTRACTION_PROMPT = """Tu es un expert en extraction de données de leads commerciaux B2B.
 
@@ -61,36 +71,39 @@ class LeadService:
         self.ai_service = ai_service
 
     async def search_leads(self, request: LeadSearchRequest) -> LeadSearchResponse:
+        # Parse natural language message via Gemini
+        parsed = await self._parse_chat_message(request.message)
+        query: str = parsed.get("query") or ""
+        location: str = parsed.get("location") or ""
+        activity_sector: str = parsed.get("activity_sector") or ""
+        ai_response: Optional[str] = parsed.get("ai_response") or None
+
+        query_parts = [p for p in [query, activity_sector, location] if p]
+        combined_query = " ".join(query_parts) if query_parts else request.message or "professionnel contact"
+
         # Build per-source search tasks and run them in parallel
-        tasks: list[asyncio.coroutine] = []
+        tasks: list = []
         task_labels: list[str] = []
 
         if "linkedin" in request.sources:
             tasks.append(self._ddgs_search(
-                query=self._build_query(request),
-                max_results=request.max_results,
+                query=combined_query,
                 include_domains=["linkedin.com"],
             ))
             task_labels.append("linkedin")
 
         if "datagouv" in request.sources:
-            dg_query = " ".join(filter(None, [
-                request.query, request.activity_sector, request.location, "entreprise"
-            ])) or "entreprise annuaire"
+            dg_query = " ".join(filter(None, [query, activity_sector, location, "entreprise"])) or "entreprise annuaire"
             tasks.append(self._ddgs_search(
                 query=dg_query,
-                max_results=max(10, request.max_results // 2),
                 include_domains=["data.gouv.fr", "annuaire-entreprises.data.gouv.fr", "entreprises.data.gouv.fr"],
             ))
             task_labels.append("datagouv")
 
         if "web" in request.sources:
-            web_query = " ".join(filter(None, [
-                request.query, request.activity_sector, request.location, "contact professionnel"
-            ])) or "contact professionnel B2B"
+            web_query = " ".join(filter(None, [query, activity_sector, location, "contact professionnel"])) or "contact professionnel B2B"
             tasks.append(self._ddgs_search(
                 query=web_query,
-                max_results=max(10, request.max_results // 2),
                 include_domains=[],
             ))
             task_labels.append("web")
@@ -98,7 +111,7 @@ class LeadService:
         if not tasks:
             return LeadSearchResponse(
                 leads=[], total=0,
-                query_used=self._build_query(request), demo_mode=False,
+                query_used=combined_query, demo_mode=False, ai_response=ai_response,
             )
 
         source_results = await asyncio.gather(*tasks)
@@ -119,31 +132,40 @@ class LeadService:
         if not all_raw:
             return LeadSearchResponse(
                 leads=[], total=0,
-                query_used=self._build_query(request), demo_mode=False,
+                query_used=combined_query, demo_mode=False, ai_response=ai_response,
             )
 
         # Enrich results that have thin snippets using Crawl4AI
-        all_raw = await self._enrich_with_crawl4ai(all_raw, max_pages=8)
+        all_raw = await self._enrich_with_crawl4ai(all_raw)
 
-        leads = await self._extract_with_ai(all_raw, request)
+        leads = await self._extract_with_ai(all_raw, query, location, activity_sector)
         return LeadSearchResponse(
             leads=leads,
             total=len(leads),
-            query_used=self._build_query(request),
+            query_used=combined_query,
             demo_mode=False,
+            ai_response=ai_response,
         )
 
-    def _build_query(self, request: LeadSearchRequest) -> str:
-        parts = [p for p in [request.query, request.activity_sector, request.location] if p]
-        return " ".join(parts) if parts else "professionnel contact"
+    async def _parse_chat_message(self, message: str) -> dict:
+        """Use Gemini to extract query params from a natural language message."""
+        if not message.strip():
+            return {"query": "", "location": None, "activity_sector": None, "ai_response": None}
+        prompt = CHAT_PARSE_PROMPT.format(message=message)
+        try:
+            raw_text = await self.ai_service.generate_text(prompt)
+            clean = re.sub(r"```(?:json)?\n?([\s\S]*?)\n?```", r"\1", raw_text).strip()
+            return json.loads(clean)
+        except Exception as exc:
+            logger.warning("Chat message parsing failed: %s", exc)
+            return {"query": message, "location": None, "activity_sector": None, "ai_response": None}
 
     async def _ddgs_search(
         self,
         query: str,
-        max_results: int,
         include_domains: list[str] | None = None,
     ) -> list[dict]:
-        """Search via duckduckgo-search library with reliable multi-page support."""
+        """Search via duckduckgo-search library with no result cap."""
         search_query = query
         if include_domains:
             site_parts = " OR ".join(f"site:{d}" for d in include_domains)
@@ -153,7 +175,7 @@ class LeadService:
             results: list[dict] = []
             try:
                 with DDGS() as ddgs:
-                    for r in ddgs.text(search_query, max_results=max_results, safesearch="off"):
+                    for r in ddgs.text(search_query, max_results=None, safesearch="off"):
                         results.append({
                             "url": r["href"],
                             "title": r["title"],
@@ -166,33 +188,35 @@ class LeadService:
 
         return await asyncio.to_thread(_sync)
 
-    async def _enrich_with_crawl4ai(
-        self,
-        results: list[dict],
-        max_pages: int = 8,
-    ) -> list[dict]:
+    async def _enrich_with_crawl4ai(self, results: list[dict]) -> list[dict]:
         """Scrape result pages with Crawl4AI to enrich thin snippets."""
+        # Crawl4AI relies on subprocess transport which is unsupported on Windows
+        if platform.system() == "Windows":
+            return results
+
         enriched = [r.copy() for r in results]
-        # Only crawl results whose snippet is too short and URL is accessible
         to_crawl = [
-            (i, r) for i, r in enumerate(enriched[:max_pages])
+            (i, r) for i, r in enumerate(enriched)
             if r.get("url", "").startswith("http") and len(r.get("content", "")) < 80
         ]
         if not to_crawl:
             return enriched
 
         try:
+            crawl_config = CrawlerRunConfig(page_timeout=10000)
             async with AsyncWebCrawler(verbose=False) as crawler:
                 crawl_tasks = [
-                    crawler.arun(url=r["url"], timeout=10) for _, r in to_crawl
+                    crawler.arun(url=r["url"], config=crawl_config) for _, r in to_crawl
                 ]
                 crawl_results = await asyncio.gather(*crawl_tasks, return_exceptions=True)
                 for (idx, _), result in zip(to_crawl, crawl_results):
                     if isinstance(result, Exception):
                         logger.debug("Crawl4AI failed for idx %d: %s", idx, result)
                         continue
-                    if hasattr(result, "markdown") and result.markdown:
-                        enriched[idx]["content"] = result.markdown[:600]
+                    md = getattr(result, "markdown", None)
+                    raw = getattr(md, "raw_markdown", None) if md else None
+                    if raw:
+                        enriched[idx]["content"] = raw[:600]
         except Exception as exc:
             logger.warning("Crawl4AI enrichment skipped: %s", exc)
 
@@ -201,7 +225,9 @@ class LeadService:
     async def _extract_with_ai(
         self,
         raw_results: list[dict],
-        request: LeadSearchRequest,
+        query: str,
+        location: str,
+        activity_sector: str,
     ) -> list[LeadResult]:
         results_for_prompt = [
             {
@@ -213,8 +239,8 @@ class LeadService:
         ]
 
         prompt = LEAD_EXTRACTION_PROMPT.format(
-            query=f"{request.query} (secteur: {request.activity_sector})",
-            location=request.location,
+            query=f"{query} (secteur: {activity_sector})" if activity_sector else query,
+            location=location,
             results_text=json.dumps(results_for_prompt, ensure_ascii=False, indent=2),
         )
 
@@ -290,8 +316,8 @@ class LeadService:
         return "?"
 
     def _demo_response(self, request: LeadSearchRequest) -> LeadSearchResponse:
-        q = request.query or "Commercial"
-        loc = request.location or "France"
+        q = request.message or "Commercial"
+        loc = "France"
         demo = [
             LeadResult(id="d1", name="Sophie Martin", job_title=f"Directrice {q}", company="TechCorp France", location=loc, url="https://www.linkedin.com/in/sophie-martin-tech", summary=f"Experte en {q.lower()} B2B avec 10 ans d'expérience dans le SaaS.", source="linkedin_profile", relevance_score=0.96, avatar_initials="SM"),
             LeadResult(id="d2", name="Thomas Dubois", job_title="CEO & Co-Founder", company="StartupIA", location=loc, url="https://www.linkedin.com/in/thomas-dubois-startup", summary="Serial entrepreneur spécialisé dans l'IA appliquée aux processus métier.", source="linkedin_profile", relevance_score=0.91, avatar_initials="TD"),
@@ -304,7 +330,7 @@ class LeadService:
         ]
         return LeadSearchResponse(
             leads=demo, total=len(demo),
-            query_used=f"{request.query} {request.location}".strip(),
+            query_used=request.message.strip(),
             demo_mode=True,
         )
 
@@ -321,6 +347,10 @@ class LeadDBService:
     async def save(self, data: LeadSaveRequest) -> LeadRecord:
         if data.linkedin_url:
             existing = await self.repo.get_by_linkedin_url(data.linkedin_url)
+            if existing:
+                return LeadRecord.model_validate(existing)
+        if data.website_url:
+            existing = await self.repo.get_by_website_url(data.website_url)
             if existing:
                 return LeadRecord.model_validate(existing)
 

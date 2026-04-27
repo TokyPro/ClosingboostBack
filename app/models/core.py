@@ -12,6 +12,7 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     role = Column(String, default="executive")  # admin, executive
+    status = Column(String, default="active")   # active, pending
     created_at = Column(DateTime, default=datetime.datetime.now(datetime.timezone.utc))
 
     opportunities = relationship("Opportunity", back_populates="owner")

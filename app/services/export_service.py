@@ -103,32 +103,40 @@ class ExportService:
         url = f"{AIRTABLE_API_URL}/{base_id}/{table_name}"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
+        # Split into creates (no airtable_id) and updates (have airtable_id)
+        to_create = [l for l in leads if not l.airtable_id]
+        to_update = [l for l in leads if l.airtable_id]
+
         async with httpx.AsyncClient(timeout=30.0) as client:
-            for lead in leads:
-                payload = {"fields": _airtable_fields(lead)}
+            # Batch creates — up to AIRTABLE_BATCH per request
+            for i in range(0, len(to_create), AIRTABLE_BATCH):
+                batch = to_create[i:i + AIRTABLE_BATCH]
+                records_payload = [{"fields": _airtable_fields(l)} for l in batch]
                 try:
-                    if lead.airtable_id:
-                        # Update existing record
-                        resp = await client.patch(f"{url}/{lead.airtable_id}", json=payload, headers=headers)
-                    else:
-                        # Create new record
-                        resp = await client.post(url, json={"records": [payload]}, headers=headers)
-                    
+                    resp = await client.post(url, json={"records": records_payload}, headers=headers)
                     if resp.status_code in (200, 201):
                         data = resp.json()
-                        # If it was a create, we get back a list of records
-                        if not lead.airtable_id and "records" in data:
-                            lead.airtable_id = data["records"][0]["id"]
-                        elif lead.airtable_id:
-                             # It was a patch, we get back the record directly
-                             pass
-                        
-                        await self.repo.update(lead)
-                        exported += 1
+                        for j, rec in enumerate(data.get("records", [])):
+                            batch[j].airtable_id = rec["id"]
+                            await self.repo.update(batch[j])
+                        exported += len(data.get("records", []))
                     else:
-                        errors.append(f"Lead {lead.id}: HTTP {resp.status_code} — {resp.text[:300]}")
+                        errors.append(f"Batch create HTTP {resp.status_code}: {resp.text[:300]}")
                 except Exception as exc:
-                    errors.append(f"Lead {lead.id}: {exc}")
+                    errors.append(f"Batch create error: {exc}")
+
+            # Batch updates — up to AIRTABLE_BATCH per request
+            for i in range(0, len(to_update), AIRTABLE_BATCH):
+                batch = to_update[i:i + AIRTABLE_BATCH]
+                records_payload = [{"id": l.airtable_id, "fields": _airtable_fields(l)} for l in batch]
+                try:
+                    resp = await client.patch(url, json={"records": records_payload}, headers=headers)
+                    if resp.status_code in (200, 201):
+                        exported += len(batch)
+                    else:
+                        errors.append(f"Batch update HTTP {resp.status_code}: {resp.text[:300]}")
+                except Exception as exc:
+                    errors.append(f"Batch update error: {exc}")
 
         return {"exported": exported, "errors": errors}
 
@@ -155,13 +163,15 @@ class ExportService:
                 payload = {"properties": _notion_properties(lead)}
                 try:
                     if lead.notion_id:
-                        # Update existing page
-                        resp = await client.patch(f"{NOTION_API_URL}/pages/{lead.notion_id}", json=payload, headers=headers)
+                        resp = await client.patch(
+                            f"{NOTION_API_URL}/pages/{lead.notion_id}",
+                            json=payload,
+                            headers=headers,
+                        )
                     else:
-                        # Create new page
                         payload["parent"] = {"database_id": database_id}
                         resp = await client.post(f"{NOTION_API_URL}/pages", json=payload, headers=headers)
-                    
+
                     if resp.status_code in (200, 201):
                         data = resp.json()
                         if not lead.notion_id:
@@ -184,51 +194,61 @@ class ExportService:
         url = f"{AIRTABLE_API_URL}/{base_id}/{table_name}"
         headers = {"Authorization": f"Bearer {api_key}"}
         imported = 0
-        errors = []
+        errors: list[str] = []
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code != 200:
-                    return {"imported": 0, "errors": [f"HTTP {resp.status_code}: {resp.text[:300]}"]}
-                
-                records = resp.json().get("records", [])
-                for rec in records:
-                    air_id = rec["id"]
-                    fields = rec["fields"]
-                    
-                    # Check if already exists
-                    lead = await self.repo.get_by_airtable_id(air_id)
-                    if not lead:
-                        # Create new lead from Airtable fields
-                        lead = Lead(
-                            airtable_id=air_id,
-                            contact_name=fields.get("Nom"),
-                            company_name=fields.get("Entreprise"),
-                            contact_title=fields.get("Poste"),
-                            contact_email=fields.get("Email"),
-                            contact_phone=fields.get("Téléphone"),
-                            linkedin_url=fields.get("LinkedIn"),
-                            website_url=fields.get("Site Web"),
-                            location=fields.get("Localisation"),
-                            activity_sector=fields.get("Secteur"),
-                            score=fields.get("Score", 0.0),
-                            tier=fields.get("Palier", "cold"),
-                            status=fields.get("Statut", "new"),
-                            notes=fields.get("Notes"),
-                            summary=fields.get("Résumé"),
-                            source=fields.get("Source", "web"),
-                        )
-                        await self.repo.create(lead)
+                offset: Optional[str] = None
+                while True:
+                    params: dict = {}
+                    if offset:
+                        params["offset"] = offset
+
+                    resp = await client.get(url, headers=headers, params=params)
+                    if resp.status_code != 200:
+                        errors.append(f"HTTP {resp.status_code}: {resp.text[:300]}")
+                        break
+
+                    data = resp.json()
+                    records = data.get("records", [])
+
+                    for rec in records:
+                        air_id = rec["id"]
+                        fields = rec["fields"]
+
+                        lead = await self.repo.get_by_airtable_id(air_id)
+                        if not lead:
+                            lead = Lead(
+                                airtable_id=air_id,
+                                contact_name=fields.get("Nom"),
+                                company_name=fields.get("Entreprise"),
+                                contact_title=fields.get("Poste"),
+                                contact_email=fields.get("Email"),
+                                contact_phone=fields.get("Téléphone"),
+                                linkedin_url=fields.get("LinkedIn"),
+                                website_url=fields.get("Site Web"),
+                                location=fields.get("Localisation"),
+                                activity_sector=fields.get("Secteur"),
+                                score=fields.get("Score", 0.0),
+                                tier=fields.get("Palier", "cold"),
+                                status=fields.get("Statut", "new"),
+                                notes=fields.get("Notes"),
+                                summary=fields.get("Résumé"),
+                                source=fields.get("Source", "web"),
+                            )
+                            await self.repo.create(lead)
+                        else:
+                            lead.contact_name = fields.get("Nom", lead.contact_name)
+                            lead.company_name = fields.get("Entreprise", lead.company_name)
+                            lead.contact_email = fields.get("Email", lead.contact_email)
+                            await self.repo.update(lead)
                         imported += 1
-                    else:
-                        # Update existing lead from Airtable (bidirectional)
-                        lead.contact_name = fields.get("Nom", lead.contact_name)
-                        lead.company_name = fields.get("Entreprise", lead.company_name)
-                        lead.contact_email = fields.get("Email", lead.contact_email)
-                        await self.repo.update(lead)
-                        imported += 1
-                        
+
+                    # Airtable returns an "offset" cursor when there are more pages
+                    offset = data.get("offset")
+                    if not offset:
+                        break
+
             return {"imported": imported, "errors": errors}
         except Exception as exc:
             return {"imported": 0, "errors": [str(exc)]}
@@ -245,65 +265,79 @@ class ExportService:
             "Content-Type": "application/json",
         }
         imported = 0
-        errors = []
+        errors: list[str] = []
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(url, headers=headers)
-                if resp.status_code != 200:
-                    return {"imported": 0, "errors": [f"HTTP {resp.status_code}: {resp.text[:300]}"]}
-                
-                results = resp.json().get("results", [])
-                for page in results:
-                    notion_id = page["id"]
-                    props = page["properties"]
-                    
-                    def get_val(p_name: str, p_type: str = "rich_text"):
-                        p = props.get(p_name, {})
-                        if p_type == "title":
-                            return p.get("title", [{}])[0].get("plain_text")
-                        if p_type == "rich_text":
-                            return p.get("rich_text", [{}])[0].get("plain_text")
-                        if p_type == "email":
-                            return p.get("email")
-                        if p_type == "phone_number":
-                            return p.get("phone_number")
-                        if p_type == "url":
-                            return p.get("url")
-                        if p_type == "number":
-                            return p.get("number")
-                        if p_type == "select":
-                            return p.get("select", {}).get("name")
-                        return None
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                cursor: Optional[str] = None
+                while True:
+                    body: dict = {}
+                    if cursor:
+                        body["start_cursor"] = cursor
 
-                    lead = await self.repo.get_by_notion_id(notion_id)
-                    if not lead:
-                        lead = Lead(
-                            notion_id=notion_id,
-                            contact_name=get_val("Nom", "title"),
-                            company_name=get_val("Entreprise"),
-                            contact_title=get_val("Poste"),
-                            contact_email=get_val("Email", "email"),
-                            contact_phone=get_val("Téléphone", "phone_number"),
-                            linkedin_url=get_val("LinkedIn", "url"),
-                            website_url=get_val("Site Web", "url"),
-                            location=get_val("Localisation"),
-                            activity_sector=get_val("Secteur"),
-                            score=get_val("Score", "number") or 0.0,
-                            tier=get_val("Palier", "select") or "cold",
-                            status=get_val("Statut", "select") or "new",
-                            summary=get_val("Résumé"),
-                            source=get_val("Source", "select") or "web",
-                        )
-                        await self.repo.create(lead)
+                    resp = await client.post(url, headers=headers, json=body)
+                    if resp.status_code != 200:
+                        errors.append(f"HTTP {resp.status_code}: {resp.text[:300]}")
+                        break
+
+                    data = resp.json()
+                    results = data.get("results", [])
+
+                    for page in results:
+                        notion_id = page["id"]
+                        props = page["properties"]
+
+                        def get_val(p_name: str, p_type: str = "rich_text") -> Optional[str]:
+                            p = props.get(p_name, {})
+                            if p_type == "title":
+                                items = p.get("title", [])
+                                return items[0].get("plain_text") if items else None
+                            if p_type == "rich_text":
+                                items = p.get("rich_text", [])
+                                return items[0].get("plain_text") if items else None
+                            if p_type == "email":
+                                return p.get("email")
+                            if p_type == "phone_number":
+                                return p.get("phone_number")
+                            if p_type == "url":
+                                return p.get("url")
+                            if p_type == "number":
+                                return p.get("number")
+                            if p_type == "select":
+                                return (p.get("select") or {}).get("name")
+                            return None
+
+                        lead = await self.repo.get_by_notion_id(notion_id)
+                        if not lead:
+                            lead = Lead(
+                                notion_id=notion_id,
+                                contact_name=get_val("Nom", "title"),
+                                company_name=get_val("Entreprise"),
+                                contact_title=get_val("Poste"),
+                                contact_email=get_val("Email", "email"),
+                                contact_phone=get_val("Téléphone", "phone_number"),
+                                linkedin_url=get_val("LinkedIn", "url"),
+                                website_url=get_val("Site Web", "url"),
+                                location=get_val("Localisation"),
+                                activity_sector=get_val("Secteur"),
+                                score=get_val("Score", "number") or 0.0,
+                                tier=get_val("Palier", "select") or "cold",
+                                status=get_val("Statut", "select") or "new",
+                                summary=get_val("Résumé"),
+                                source=get_val("Source", "select") or "web",
+                            )
+                            await self.repo.create(lead)
+                        else:
+                            lead.contact_name = get_val("Nom", "title") or lead.contact_name
+                            lead.company_name = get_val("Entreprise") or lead.company_name
+                            await self.repo.update(lead)
                         imported += 1
-                    else:
-                        # Update existing
-                        lead.contact_name = get_val("Nom", "title") or lead.contact_name
-                        lead.company_name = get_val("Entreprise") or lead.company_name
-                        await self.repo.update(lead)
-                        imported += 1
-                        
+
+                    # Notion pagination: loop until has_more is False
+                    if not data.get("has_more"):
+                        break
+                    cursor = data.get("next_cursor")
+
             return {"imported": imported, "errors": errors}
         except Exception as exc:
             return {"imported": 0, "errors": [str(exc)]}

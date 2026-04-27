@@ -27,6 +27,10 @@ class LeadRepository:
         result = await self.db.execute(select(Lead).where(Lead.linkedin_url == url))
         return result.scalar_one_or_none()
 
+    async def get_by_website_url(self, url: str) -> Optional[Lead]:
+        result = await self.db.execute(select(Lead).where(Lead.website_url == url))
+        return result.scalar_one_or_none()
+
     async def get_by_notion_id(self, notion_id: str) -> Optional[Lead]:
         result = await self.db.execute(select(Lead).where(Lead.notion_id == notion_id))
         return result.scalar_one_or_none()

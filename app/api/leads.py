@@ -1,16 +1,18 @@
+import logging
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..database import get_db
+from ..database import get_db, AsyncSessionLocal
 from ..schemas.leads import (
     AirtableExportRequest,
     AirtableImportRequest,
     ExportResult,
     ImportResult,
     LeadRecord,
+    LeadResult,
     LeadSaveRequest,
     LeadSearchRequest,
     LeadSearchResponse,
@@ -23,17 +25,51 @@ from ..services.ai_service import AIIntelligenceService
 from ..services.export_service import ExportService
 from ..services.lead_service import LeadDBService, LeadService
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _ai_service = AIIntelligenceService()
 _search_service = LeadService(ai_service=_ai_service)
 
+AUTO_SAVE_THRESHOLD = 0.15
+
+
+async def _auto_save_qualifying_leads(leads: list[LeadResult], query_used: str) -> None:
+    qualifying = [l for l in leads if l.relevance_score > AUTO_SAVE_THRESHOLD]
+    if not qualifying:
+        return
+    async with AsyncSessionLocal() as db:
+        svc = LeadDBService(db)
+        for lead in qualifying:
+            is_linkedin = "linkedin.com" in (lead.url or "")
+            try:
+                await svc.save(LeadSaveRequest(
+                    company_name=lead.company,
+                    contact_name=lead.name,
+                    contact_title=lead.job_title,
+                    location=lead.location,
+                    linkedin_url=lead.url if is_linkedin else None,
+                    website_url=lead.url if not is_linkedin else None,
+                    summary=lead.summary,
+                    source=lead.source,
+                    relevance_score=lead.relevance_score,
+                    search_query=query_used,
+                ))
+            except Exception as exc:
+                logger.debug("Auto-save skipped for %s: %s", lead.url, exc)
+
 
 # ── Search (stateless) ────────────────────────────────────────────────────────
 
 @router.post("/search", response_model=LeadSearchResponse, summary="Search leads via Crawl4AI + Gemini")
-async def search_leads(request: LeadSearchRequest) -> LeadSearchResponse:
-    return await _search_service.search_leads(request)
+async def search_leads(
+    request: LeadSearchRequest,
+    background_tasks: BackgroundTasks,
+) -> LeadSearchResponse:
+    result = await _search_service.search_leads(request)
+    if result.leads:
+        background_tasks.add_task(_auto_save_qualifying_leads, result.leads, result.query_used)
+    return result
 
 
 # ── Persistence CRUD ──────────────────────────────────────────────────────────

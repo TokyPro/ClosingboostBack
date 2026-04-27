@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from typing import Dict, Any
@@ -221,14 +222,24 @@ class AIIntelligenceService:
         if not self.api_key:
             return "{}"
         client = genai.Client(api_key=self.api_key)
-        try:
-            response = await client.aio.models.generate_content(
-                model=self.model_name, contents=prompt,
-            )
-            return response.text.strip()
-        except Exception as exc:
-            logger.error("Gemini generate_text failed: %s", exc)
-            return "{}"
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = await client.aio.models.generate_content(
+                    model=self.model_name, contents=prompt,
+                )
+                return response.text.strip()
+            except Exception as exc:
+                last_exc = exc
+                err_str = str(exc)
+                if any(code in err_str for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning("Gemini transient error (attempt %d/3), retrying in %ds: %s", attempt + 1, wait, exc)
+                    await asyncio.sleep(wait)
+                else:
+                    break
+        logger.error("Gemini generate_text failed: %s", last_exc)
+        return "{}"
 
     async def generate_cold_message(self, lead_context: str, company_news: str) -> dict:
         if not self.api_key:
