@@ -41,29 +41,31 @@ Retourne UNIQUEMENT un objet JSON valide (sans markdown) :
 
 LEAD_EXTRACTION_PROMPT = """Tu es un expert en extraction de données de leads commerciaux B2B.
 
-À partir des résultats de recherche suivants, extrais les informations structurées pour chaque lead potentiel.
+À partir des résultats de recherche suivants, extrais les informations structurées pour TOUS les leads.
 
 Contexte de la recherche : thématique="{query}", localisation="{location}"
 
 Résultats bruts (titre, URL, extrait) :
 {results_text}
 
-Pour chaque résultat pertinent, extrais :
+Pour CHAQUE résultat (sans exception), extrais :
 - name : prénom et nom complet (uniquement pour profils individuels, null pour les entreprises)
 - job_title : titre du poste actuel (null si non disponible)
 - company : nom de l'entreprise actuelle (null si non disponible)
 - location : ville et/ou pays (null si non disponible)
 - source : "linkedin_profile" si l'URL contient linkedin.com/in/, "linkedin_company" si linkedin.com/company/, "datagouv" si l'URL contient data.gouv.fr ou annuaire-entreprises, sinon "web"
-- summary : 1 phrase de présentation du lead ou de l'entreprise (en français)
+- summary : 1 phrase de présentation du lead ou de l'entreprise (en français), null si vraiment impossible
+- relevance_score : score de pertinence entre 0.10 et 1.0 selon la correspondance avec la thématique et la localisation
 
 Règles importantes :
-- N'inclure que les résultats clairement pertinents pour la thématique et la localisation demandées
+- Inclure TOUS les résultats, même ceux peu pertinents (score minimum 0.10)
+- Les résultats très pertinents reçoivent un score >= 0.70, les moyennement pertinents entre 0.30 et 0.69, les faiblement pertinents entre 0.10 et 0.29
 - Pour les pages linkedin.com/company/, name doit être null
 - Si une information est absente ou incertaine, mettre null
 - Le tableau "leads" doit avoir exactement autant d'éléments que les résultats fournis (même ordre)
 
 Retourne UNIQUEMENT un objet JSON valide sans markdown ni explication :
-{{"leads": [{{"name": null, "job_title": null, "company": null, "location": null, "source": "web", "summary": null}}]}}"""
+{{"leads": [{{"name": null, "job_title": null, "company": null, "location": null, "source": "web", "summary": null, "relevance_score": 0.5}}]}}"""
 
 
 class LeadService:
@@ -180,7 +182,7 @@ class LeadService:
                             "url": r["href"],
                             "title": r["title"],
                             "content": r.get("body", ""),
-                            "score": 0.8,
+                            "score": 0.5,
                         })
             except Exception as exc:
                 logger.error("DDGS search error for '%s': %s", search_query, exc)
@@ -257,7 +259,9 @@ class LeadService:
         leads: list[LeadResult] = []
         for i, item in enumerate(extracted):
             source_url = raw_results[i]["url"] if i < len(raw_results) else ""
-            score = float(raw_results[i].get("score", 0.5)) if i < len(raw_results) else 0.5
+            ai_score = item.get("relevance_score")
+            score = float(ai_score) if ai_score is not None else float(raw_results[i].get("score", 0.5)) if i < len(raw_results) else 0.5
+            score = max(0.10, min(1.0, score))
             name = item.get("name") or ""
             leads.append(LeadResult(
                 id=str(uuid.uuid4()),

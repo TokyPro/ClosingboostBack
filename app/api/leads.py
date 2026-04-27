@@ -9,6 +9,7 @@ from ..database import get_db, AsyncSessionLocal
 from ..schemas.leads import (
     AirtableExportRequest,
     AirtableImportRequest,
+    BatchEnrichRequest,
     ExportResult,
     ImportResult,
     LeadRecord,
@@ -36,7 +37,16 @@ _search_service = LeadService(ai_service=_ai_service)
 async def get_enrichment_service(db: AsyncSession = Depends(get_db)) -> EnrichmentService:
     return EnrichmentService(db, _ai_service)
 
-AUTO_SAVE_THRESHOLD = 0.15
+AUTO_SAVE_THRESHOLD = 0.10
+
+
+async def _bg_enrich(lead_id: str) -> None:
+    async with AsyncSessionLocal() as db:
+        svc = EnrichmentService(db, _ai_service)
+        try:
+            await svc.enrich_lead(lead_id)
+        except Exception as exc:
+            logger.debug("Background enrich failed for %s: %s", lead_id, exc)
 
 
 async def _auto_save_qualifying_leads(leads: list[LeadResult], query_used: str) -> None:
@@ -87,10 +97,14 @@ async def search_leads(
 )
 async def save_lead(
     data: LeadSaveRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> LeadRecord:
     svc = LeadDBService(db)
-    return await svc.save(data)
+    record = await svc.save(data)
+    # Auto-enrich in background
+    background_tasks.add_task(_bg_enrich, record.id)
+    return record
 
 
 @router.get("/saved", response_model=LeadsListResponse, summary="List all saved leads")
@@ -130,6 +144,22 @@ async def delete_saved_lead(
     if not await svc.delete(lead_id):
         raise HTTPException(status_code=404, detail="Lead not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/saved/batch-enrich", summary="Batch enrich multiple leads")
+async def batch_enrich_leads(
+    data: BatchEnrichRequest,
+    service: EnrichmentService = Depends(get_enrichment_service),
+) -> dict:
+    results = []
+    for lead_id in data.lead_ids:
+        try:
+            result = await service.enrich_lead(lead_id)
+            if result:
+                results.append(result)
+        except Exception as exc:
+            logger.warning("Batch enrich failed for %s: %s", lead_id, exc)
+    return {"enriched": len(results), "total": len(data.lead_ids)}
 
 
 @router.post("/saved/{lead_id}/enrich", summary="Enrich a lead with AI and web research")

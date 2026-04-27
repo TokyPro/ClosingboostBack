@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
@@ -88,3 +88,24 @@ async def get_score_events(lead_id: str, db: AsyncSession = Depends(get_db)):
     repo = OutreachRepository(db)
     events = await repo.get_score_events_by_lead(lead_id)
     return events
+
+
+@router.get("/alerts/hot-follow-up", summary="Hot leads needing follow-up")
+async def get_hot_follow_up_alerts(
+    days: int = Query(default=3, ge=1),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    svc = ScoringService(db)
+    leads = await svc.get_hot_follow_up_alerts(days)
+    return {
+        "count": len(leads),
+        "leads": [
+            {
+                "id": str(l.id),
+                "company_name": l.company_name,
+                "score": l.score,
+                "last_outreach_at": l.last_outreach_at.isoformat() if l.last_outreach_at else None,
+            }
+            for l in leads
+        ],
+    }

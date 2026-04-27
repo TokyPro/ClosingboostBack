@@ -210,3 +210,15 @@ class Document(Base):
     google_file_id = Column(String, nullable=True) # Google File API resource name
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
+
+
+class EmailTemplate(Base):
+    __tablename__ = "email_templates"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False)
+    tier = Column(String, default="all")  # cold | warm | hot | all
+    subject = Column(String, nullable=False)
+    body = Column(Text, nullable=False)
+    variables = Column(JSON, nullable=True)  # list of variable names e.g. ["contact_name", "company"]
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))

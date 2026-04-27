@@ -132,6 +132,7 @@ class UserCreateAdmin(BaseModel):
     email: str
     password: str
     role: str = "executive"
+    status: str = "active"
 
 class DocumentSchema(BaseModel):
     model_config = ConfigDict(from_attributes=True)

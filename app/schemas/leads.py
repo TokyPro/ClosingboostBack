@@ -217,6 +217,10 @@ class AgentRecommendation(BaseModel):
 
 # ── Export schemas ────────────────────────────────────────────────────────────
 
+class BatchEnrichRequest(BaseModel):
+    lead_ids: list[str]
+
+
 class AirtableExportRequest(BaseModel):
     lead_ids: list[str]
     api_key: str

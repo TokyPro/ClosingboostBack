@@ -85,6 +85,16 @@ class LeadRepository:
         )
         return result.scalar_one()
 
+    async def get_hot_needing_followup(self, cutoff: datetime.datetime) -> list[Lead]:
+        from sqlalchemy import or_
+        result = await self.db.execute(
+            select(Lead).where(
+                Lead.tier == "hot",
+                or_(Lead.last_outreach_at == None, Lead.last_outreach_at < cutoff)
+            )
+        )
+        return list(result.scalars().all())
+
     async def get_hot_with_max_attempts(self, max_attempts: int) -> list[Lead]:
         """Hot leads that exceeded max outreach attempts — candidates for cooldown."""
         result = await self.db.execute(

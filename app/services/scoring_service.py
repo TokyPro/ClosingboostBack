@@ -152,6 +152,11 @@ class ScoringService:
             degraded_ids.append(lead.id)
         return degraded_ids
 
+    async def get_hot_follow_up_alerts(self, days: int = 3) -> list[Lead]:
+        """Returns hot leads that haven't been contacted in the last N days."""
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+        return await self.lead_repo.get_hot_needing_followup(cutoff)
+
     async def get_pipeline_stats(self) -> dict:
         cold = await self.lead_repo.count_by_tier("cold")
         warm = await self.lead_repo.count_by_tier("warm")

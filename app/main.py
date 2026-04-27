@@ -26,6 +26,7 @@ from .api import leads
 from .api import scoring as scoring_api
 from .api import agents as agents_api
 from .api import outreach as outreach_api
+from .api import templates as templates_api
 from sqlalchemy import text
 from .core.config import settings
 from .core.security import get_current_user, get_password_hash
@@ -59,7 +60,7 @@ async def _seed_admin() -> None:
             )
             await repo.create(admin)
 
-@asynccontextmanager
+
 async def lifespan(app: FastAPI):
     await create_db_and_tables()
     await _migrate_db()
@@ -144,6 +145,7 @@ app.include_router(leads.router, prefix="/api/leads", tags=["Lead Intelligence"]
 app.include_router(scoring_api.router, prefix="/api/scoring", tags=["Scoring & Segmentation"], dependencies=_auth_dep)
 app.include_router(agents_api.router, prefix="/api/agents", tags=["AI Agents"], dependencies=_auth_dep)
 app.include_router(outreach_api.router, prefix="/api/outreach", tags=["Outreach Sequences"], dependencies=_auth_dep)
+app.include_router(templates_api.router, prefix="/api/templates", tags=["Templates"], dependencies=_auth_dep)
 
 @app.get("/", tags=["System"])
 async def health_check():
