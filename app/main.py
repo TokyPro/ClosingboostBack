@@ -25,12 +25,14 @@ from .api import admin as admin_api
 from .api import leads
 from .api import scoring as scoring_api
 from .api import agents as agents_api
+from .api import outreach as outreach_api
 from sqlalchemy import text
 from .core.config import settings
 from .core.security import get_current_user, get_password_hash
 from .database import create_db_and_tables, AsyncSessionLocal, engine
 from .models.core import User
 from .repositories.user_repository import UserRepository
+from .workers.sequence_worker import start_worker
 
 ADMIN_EMAIL = "admin@salesboost.ai"
 ADMIN_PASSWORD = "admin"
@@ -62,7 +64,18 @@ async def lifespan(app: FastAPI):
     await create_db_and_tables()
     await _migrate_db()
     await _seed_admin()
+    
+    # Start the background worker for sequences
+    worker_task = asyncio.create_task(start_worker())
+    
     yield
+    
+    # Clean up background tasks
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
 
 app = FastAPI(
     title="SalesBoost AI - Intelligence Console API",
@@ -130,6 +143,7 @@ app.include_router(admin_api.router, prefix="/api/admin", tags=["Admin"], depend
 app.include_router(leads.router, prefix="/api/leads", tags=["Lead Intelligence"], dependencies=_auth_dep)
 app.include_router(scoring_api.router, prefix="/api/scoring", tags=["Scoring & Segmentation"], dependencies=_auth_dep)
 app.include_router(agents_api.router, prefix="/api/agents", tags=["AI Agents"], dependencies=_auth_dep)
+app.include_router(outreach_api.router, prefix="/api/outreach", tags=["Outreach Sequences"], dependencies=_auth_dep)
 
 @app.get("/", tags=["System"])
 async def health_check():

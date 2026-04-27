@@ -49,7 +49,7 @@ class AgentService:
         )
         return "\n".join(parts)
 
-    async def run_agent(self, lead_id: str) -> Optional[dict]:
+    async def run_agent(self, lead_id: str, sequence_id: Optional[str] = None) -> Optional[dict]:
         lead = await self.lead_repo.get_by_id(lead_id)
         if not lead:
             return None
@@ -62,6 +62,9 @@ class AgentService:
 
         lead_context = self._build_lead_context(lead)
         tier = lead.tier
+
+        # If in a sequence, we might want to adjust the generation logic
+        # For now, let's just pass the sequence_id to the OutreachMessage
 
         if tier == "cold":
             news_str = ""
@@ -103,6 +106,7 @@ class AgentService:
         # Save the generated message as draft
         outreach = OutreachMessage(
             lead_id=lead_id,
+            sequence_id=sequence_id,
             tier=tier,
             channel=channel,
             subject=subject,

@@ -157,6 +157,13 @@ class ScoringService:
         warm = await self.lead_repo.count_by_tier("warm")
         hot = await self.lead_repo.count_by_tier("hot")
         total = cold + warm + hot
+        
+        # Simple conversion stats based on events
+        scored_events = await self.outreach_repo.get_events_by_type("scored")
+        
+        warm_conversions = len([e for e in scored_events if e.event_metadata and e.event_metadata.get("tier") == "warm"])
+        hot_conversions = len([e for e in scored_events if e.event_metadata and e.event_metadata.get("tier") == "hot"])
+        
         return {
             "cold_count": cold,
             "warm_count": warm,
@@ -165,4 +172,10 @@ class ScoringService:
             "cold_pct": round(cold / total * 100, 1) if total else 0.0,
             "warm_pct": round(warm / total * 100, 1) if total else 0.0,
             "hot_pct": round(hot / total * 100, 1) if total else 0.0,
+            "conversions": {
+                "to_warm": warm_conversions,
+                "to_hot": hot_conversions,
+                "warm_rate": round(warm_conversions / total * 100, 1) if total else 0.0,
+                "hot_rate": round(hot_conversions / total * 100, 1) if total else 0.0,
+            }
         }

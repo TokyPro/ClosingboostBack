@@ -24,12 +24,17 @@ from ..schemas.leads import (
 from ..services.ai_service import AIIntelligenceService
 from ..services.export_service import ExportService
 from ..services.lead_service import LeadDBService, LeadService
+from ..services.enrichment_service import EnrichmentService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _ai_service = AIIntelligenceService()
 _search_service = LeadService(ai_service=_ai_service)
+
+# --- Dependency Functions ---
+async def get_enrichment_service(db: AsyncSession = Depends(get_db)) -> EnrichmentService:
+    return EnrichmentService(db, _ai_service)
 
 AUTO_SAVE_THRESHOLD = 0.15
 
@@ -125,6 +130,28 @@ async def delete_saved_lead(
     if not await svc.delete(lead_id):
         raise HTTPException(status_code=404, detail="Lead not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/saved/{lead_id}/enrich", summary="Enrich a lead with AI and web research")
+async def enrich_lead(
+    lead_id: str,
+    service: EnrichmentService = Depends(get_enrichment_service),
+) -> dict:
+    result = await service.enrich_lead(lead_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return result
+
+
+@router.get("/saved/{lead_id}/signals", summary="Detect buying signals for a lead")
+async def get_lead_signals(
+    lead_id: str,
+    service: EnrichmentService = Depends(get_enrichment_service),
+) -> dict:
+    result = await service.fetch_signals(lead_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return result
 
 
 @router.post("/saved/{lead_id}/convert", summary="Convert a lead to an opportunity")

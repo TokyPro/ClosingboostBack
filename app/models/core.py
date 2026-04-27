@@ -130,6 +130,7 @@ class Lead(Base):
 
     score_events = relationship("ScoreEvent", back_populates="lead", cascade="all, delete-orphan")
     outreach_messages = relationship("OutreachMessage", back_populates="lead", cascade="all, delete-orphan")
+    outreach_sequences = relationship("OutreachSequence", back_populates="lead", cascade="all, delete-orphan")
 
 
 class ScoringConfig(Base):
@@ -149,10 +150,25 @@ class ScoringConfig(Base):
     updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
 
 
+class OutreachSequence(Base):
+    __tablename__ = "outreach_sequences"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    lead_id = Column(String, ForeignKey("leads.id"), nullable=False)
+    status = Column(String, default="active")  # active | paused | completed | cancelled
+    current_step = Column(Integer, default=1)
+    total_steps = Column(Integer, default=3)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
+
+    lead = relationship("Lead", back_populates="outreach_sequences")
+    messages = relationship("OutreachMessage", back_populates="sequence")
+
+
 class OutreachMessage(Base):
     __tablename__ = "outreach_messages"
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     lead_id = Column(String, ForeignKey("leads.id"), nullable=False)
+    sequence_id = Column(String, ForeignKey("outreach_sequences.id"), nullable=True)
     tier = Column(String, nullable=False)
     channel = Column(String, default="email")
     subject = Column(String, nullable=True)
@@ -166,6 +182,7 @@ class OutreachMessage(Base):
     score_after = Column(Float, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
     lead = relationship("Lead", back_populates="outreach_messages")
+    sequence = relationship("OutreachSequence", back_populates="messages")
 
 
 class ScoreEvent(Base):

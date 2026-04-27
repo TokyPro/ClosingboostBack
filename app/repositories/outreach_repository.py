@@ -66,6 +66,12 @@ class OutreachRepository:
         )
         return list(result.scalars().all())
 
+    async def get_events_by_type(self, event_type: str) -> list[ScoreEvent]:
+        result = await self.db.execute(
+            select(ScoreEvent).where(ScoreEvent.event_type == event_type)
+        )
+        return list(result.scalars().all())
+
     async def get_scoring_config(self) -> Optional[ScoringConfig]:
         result = await self.db.execute(select(ScoringConfig).limit(1))
         return result.scalar_one_or_none()
