@@ -24,6 +24,8 @@ class LeadResult(BaseModel):
     source: str = "web"
     relevance_score: float = 0.0
     avatar_initials: str = "?"
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
 
 
 class LeadSearchResponse(BaseModel):
@@ -40,6 +42,8 @@ class LeadSaveRequest(BaseModel):
     company_name: Optional[str] = None
     contact_name: Optional[str] = None
     contact_title: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
     activity_sector: Optional[str] = None
     website_url: Optional[str] = None
     linkedin_url: Optional[str] = None     # None for pure-web results

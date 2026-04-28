@@ -111,7 +111,7 @@ async def save_lead(
 async def list_saved_leads(
     status_filter: Optional[str] = Query(default=None, alias="status"),
     page: int = Query(default=1, ge=1),
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=10, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ) -> LeadsListResponse:
     svc = LeadDBService(db)

@@ -4,14 +4,14 @@ import asyncio
 import datetime
 import json
 import logging
-import platform
 import re
 import uuid
 from typing import Optional
 from uuid import UUID
 
-from crawl4ai import AsyncWebCrawler
-from crawl4ai.async_configs import CrawlerRunConfig
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+from crawl4ai.content_filter_strategy import BM25ContentFilter
+from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from ddgs import DDGS
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,12 +49,14 @@ Résultats bruts (titre, URL, extrait) :
 {results_text}
 
 Pour CHAQUE résultat (sans exception), extrais :
-- name : prénom et nom complet (uniquement pour profils individuels, null pour les entreprises)
-- job_title : titre du poste actuel (null si non disponible)
-- company : nom de l'entreprise actuelle (null si non disponible)
+- name : prénom et nom complet du contact (uniquement pour profils individuels, null pour les entreprises)
+- job_title : titre du poste actuel du contact (null si non disponible)
+- company : nom de l'entreprise (null si non disponible)
 - location : ville et/ou pays (null si non disponible)
 - source : "linkedin_profile" si l'URL contient linkedin.com/in/, "linkedin_company" si linkedin.com/company/, "datagouv" si l'URL contient data.gouv.fr ou annuaire-entreprises, sinon "web"
-- summary : 1 phrase de présentation du lead ou de l'entreprise (en français), null si vraiment impossible
+- contact_email : adresse email trouvée dans le contenu (format valide uniquement ex: prenom@domaine.com, null si absent)
+- contact_phone : numéro de téléphone trouvé dans le contenu (format international si possible ex: +33 6 12 34 56 78, null si absent)
+- summary : 1-2 phrases décrivant l'activité principale de l'entreprise (en français, orienté entreprise et non pas contact), null si vraiment impossible
 - relevance_score : score de pertinence entre 0.10 et 1.0 selon la correspondance avec la thématique et la localisation
 
 Règles importantes :
@@ -65,7 +67,7 @@ Règles importantes :
 - Le tableau "leads" doit avoir exactement autant d'éléments que les résultats fournis (même ordre)
 
 Retourne UNIQUEMENT un objet JSON valide sans markdown ni explication :
-{{"leads": [{{"name": null, "job_title": null, "company": null, "location": null, "source": "web", "summary": null, "relevance_score": 0.5}}]}}"""
+{{"leads": [{{"name": null, "job_title": null, "company": null, "location": null, "source": "web", "contact_email": null, "contact_phone": null, "summary": null, "relevance_score": 0.5}}]}}"""
 
 
 class LeadService:
@@ -98,7 +100,7 @@ class LeadService:
             dg_query = " ".join(filter(None, [query, activity_sector, location, "entreprise"])) or "entreprise annuaire"
             tasks.append(self._ddgs_search(
                 query=dg_query,
-                include_domains=["data.gouv.fr", "annuaire-entreprises.data.gouv.fr", "entreprises.data.gouv.fr"],
+                include_domains=["annuaire-entreprises.data.gouv.fr"],
             ))
             task_labels.append("datagouv")
 
@@ -137,8 +139,14 @@ class LeadService:
                 query_used=combined_query, demo_mode=False, ai_response=ai_response,
             )
 
-        # Enrich results that have thin snippets using Crawl4AI
-        all_raw = await self._enrich_with_crawl4ai(all_raw)
+        # Enrich results using Crawl4AI (30s global timeout — non-blocking on failure)
+        try:
+            all_raw = await asyncio.wait_for(
+                self._enrich_with_crawl4ai(all_raw),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Crawl4AI enrichment timed out — proceeding with raw DDGS content")
 
         leads = await self._extract_with_ai(all_raw, query, location, activity_sector)
         return LeadSearchResponse(
@@ -166,18 +174,19 @@ class LeadService:
         self,
         query: str,
         include_domains: list[str] | None = None,
+        max_results: int = 15,
     ) -> list[dict]:
-        """Search via duckduckgo-search library with no result cap."""
+        """Search via duckduckgo-search library, capped at max_results per source."""
         search_query = query
         if include_domains:
-            site_parts = " OR ".join(f"site:{d}" for d in include_domains)
-            search_query = f"{query} ({site_parts})"
+            # Use only the first domain — DuckDuckGo doesn't support multi-site OR syntax
+            search_query = f"{query} site:{include_domains[0]}"
 
         def _sync() -> list[dict]:
             results: list[dict] = []
             try:
                 with DDGS() as ddgs:
-                    for r in ddgs.text(search_query, max_results=None, safesearch="off"):
+                    for r in ddgs.text(search_query, max_results=max_results, safesearch="off"):
                         results.append({
                             "url": r["href"],
                             "title": r["title"],
@@ -191,36 +200,67 @@ class LeadService:
         return await asyncio.to_thread(_sync)
 
     async def _enrich_with_crawl4ai(self, results: list[dict]) -> list[dict]:
-        """Scrape result pages with Crawl4AI to enrich thin snippets."""
-        # Crawl4AI relies on subprocess transport which is unsupported on Windows
-        if platform.system() == "Windows":
-            return results
+        """Crawl result pages with Crawl4AI to extract contact info and company description.
 
+        Skips LinkedIn URLs (they block crawlers). Uses BM25 content filtering
+        to surface contact-relevant content (email, phone, company description).
+        """
         enriched = [r.copy() for r in results]
-        to_crawl = [
-            (i, r) for i, r in enumerate(enriched)
-            if r.get("url", "").startswith("http") and len(r.get("content", "")) < 80
+
+        # Only crawl non-LinkedIn pages that have thin content
+        to_crawl: list[tuple[int, dict]] = [
+            (i, r)
+            for i, r in enumerate(enriched)
+            if (
+                r.get("url", "").startswith("http")
+                and "linkedin.com" not in r.get("url", "")
+                and len(r.get("content", "")) < 400
+            )
         ]
         if not to_crawl:
             return enriched
 
+        # BM25 filter focused on contact and company data
+        bm25_filter = BM25ContentFilter(
+            user_query="contact email téléphone phone entreprise activité description société",
+            bm25_threshold=1.0,
+        )
+        md_gen = DefaultMarkdownGenerator(content_filter=bm25_filter)
+
+        browser_config = BrowserConfig(headless=True, verbose=False)
+        crawler_config = CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            page_timeout=15000,
+            remove_overlay_elements=True,
+            markdown_generator=md_gen,
+        )
+
+        urls = [r["url"] for _, r in to_crawl]
+        logger.info("Crawl4AI: crawling %d URLs for lead enrichment", len(urls))
+
         try:
-            crawl_config = CrawlerRunConfig(page_timeout=10000)
-            async with AsyncWebCrawler(verbose=False) as crawler:
-                crawl_tasks = [
-                    crawler.arun(url=r["url"], config=crawl_config) for _, r in to_crawl
-                ]
-                crawl_results = await asyncio.gather(*crawl_tasks, return_exceptions=True)
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                crawl_results = await crawler.arun_many(
+                    urls=urls,
+                    config=crawler_config,
+                    max_concurrent=3,
+                )
                 for (idx, _), result in zip(to_crawl, crawl_results):
-                    if isinstance(result, Exception):
-                        logger.debug("Crawl4AI failed for idx %d: %s", idx, result)
+                    if isinstance(result, Exception) or not result.success:
+                        logger.debug("Crawl4AI failed for %s: %s", enriched[idx]["url"], result)
                         continue
                     md = getattr(result, "markdown", None)
-                    raw = getattr(md, "raw_markdown", None) if md else None
-                    if raw:
-                        enriched[idx]["content"] = raw[:600]
+                    # Prefer BM25-filtered content, fall back to raw markdown
+                    content = (
+                        getattr(md, "fit_markdown", None)
+                        or getattr(md, "raw_markdown", None)
+                        or ""
+                    )
+                    if content:
+                        enriched[idx]["content"] = content[:800]
+                        logger.debug("Crawl4AI enriched idx %d: %d chars", idx, len(content))
         except Exception as exc:
-            logger.warning("Crawl4AI enrichment skipped: %s", exc)
+            logger.warning("Crawl4AI enrichment failed: %s", exc)
 
         return enriched
 
@@ -256,6 +296,11 @@ class LeadService:
             logger.error("AI lead extraction failed: %s — falling back to basic parse", exc)
             return self._basic_parse(raw_results)
 
+        # If Gemini returned an empty array despite having raw results, use basic parse
+        if not extracted and raw_results:
+            logger.warning("AI returned empty leads array — falling back to basic parse")
+            return self._basic_parse(raw_results)
+
         leads: list[LeadResult] = []
         for i, item in enumerate(extracted):
             source_url = raw_results[i]["url"] if i < len(raw_results) else ""
@@ -274,6 +319,8 @@ class LeadService:
                 source=item.get("source", "web"),
                 relevance_score=round(score, 2),
                 avatar_initials=self._initials(name),
+                contact_email=item.get("contact_email") or None,
+                contact_phone=item.get("contact_phone") or None,
             ))
         return leads
 
@@ -362,6 +409,8 @@ class LeadDBService:
             company_name=data.company_name,
             contact_name=data.contact_name,
             contact_title=data.contact_title,
+            contact_email=data.contact_email,
+            contact_phone=data.contact_phone,
             activity_sector=data.activity_sector,
             website_url=data.website_url,
             linkedin_url=data.linkedin_url,
